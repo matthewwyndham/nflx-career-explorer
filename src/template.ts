@@ -40,6 +40,7 @@ header { position: sticky; top: 0; z-index: 10; background: var(--bg-elev);
 .title-row .meta { color: var(--fg-dim); font-size: 12px; }
 .title-row .pills { color: var(--fg-dim); font-size: 12px; }
 .title-row .pills b { color: var(--fg); font-weight: 500; }
+.title-btn { padding: 2px 8px; font-size: 11px; }
 .spacer { flex: 1 1 auto; }
 .count { color: var(--fg); font-size: 12px; }
 .toolbar { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
@@ -119,6 +120,7 @@ main { padding: 0 14px 24px; }
     <h1>NETFLIX CAREERS</h1>
     <span class="meta">__TEAM__ · last sync __LAST_SYNCED__</span>
     <span class="pills">__PILLS__</span>
+    <button id="toggleTimeline" class="title-btn" title="postings & removals over time">↗ timeline</button>
     <span class="spacer"></span>
     <span class="count" id="count">…</span>
   </div>
@@ -150,7 +152,6 @@ main { padding: 0 14px 24px; }
     </select>
     <button id="reset" title="clear all filters">reset</button>
     <button id="expandAll" title="expand all visible rows">expand</button>
-    <button id="toggleTimeline" title="postings & removals over time">↗ timeline</button>
   </div>
 </header>
 <div class="modal-overlay" id="timelineModal" role="dialog" aria-modal="true" aria-label="postings and removals over time">
