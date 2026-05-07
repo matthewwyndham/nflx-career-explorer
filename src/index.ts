@@ -5,6 +5,8 @@ import type { Env } from './types';
 
 const HTML_CACHE_SECONDS = 600;
 
+const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#e50914" stroke="#e50914" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12a10.06 10.06 0 0 0-20 0Z"/><path d="M12 12v8a2 2 0 0 0 4 0" fill="none"/></svg>`;
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -17,6 +19,14 @@ export default {
           return await handleRawJobs(env);
         case '/sync':
           return await handleSync(request, env);
+        case '/favicon.svg':
+        case '/favicon.ico':
+          return new Response(FAVICON_SVG, {
+            headers: {
+              'content-type': 'image/svg+xml',
+              'cache-control': 'public, max-age=86400',
+            },
+          });
         case '/healthz':
           return new Response('ok', { headers: { 'content-type': 'text/plain' } });
         default:

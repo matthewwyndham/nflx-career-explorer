@@ -10,6 +10,7 @@ export const HTML_TEMPLATE = String.raw`<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <title>Netflix Careers Explorer</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
 :root {
   --bg: #0a0a0a;
