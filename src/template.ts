@@ -82,6 +82,35 @@ main { padding: 0 14px 24px; }
 ::-webkit-scrollbar-track { background: var(--bg); }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: #444; }
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7);
+  display: none; align-items: center; justify-content: center; z-index: 100; }
+.modal-overlay.open { display: flex; }
+.modal { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px;
+  width: min(960px, 92vw); max-height: 88vh; overflow: auto; padding: 14px 16px 12px;
+  position: relative; box-shadow: 0 10px 40px rgba(0,0,0,0.6); }
+.modal-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+.modal-head h2 { margin: 0; font-size: 13px; color: var(--accent); letter-spacing: 1px; }
+.modal-head .meta { color: var(--fg-dim); font-size: 11px; }
+.modal-close { position: absolute; top: 8px; right: 10px; background: none; border: none;
+  color: var(--fg-dim); font-size: 18px; cursor: pointer; padding: 2px 6px; }
+.modal-close:hover { color: var(--accent); border: none; }
+.timeline-svg { width: 100%; height: 320px; display: block; }
+.timeline-svg circle.new-dot { fill: var(--accent); cursor: pointer; transition: r .12s ease; }
+.timeline-svg circle.rem-dot { fill: none; stroke: var(--removed); stroke-width: 1.2;
+  cursor: pointer; opacity: 0.7; }
+.timeline-svg circle.new-dot:hover { stroke: white; stroke-width: 1.5; }
+.timeline-svg circle.rem-dot:hover { opacity: 1; stroke-width: 2; }
+.timeline-svg .axis { stroke: var(--fg-faint); stroke-dasharray: 2 3; }
+.timeline-svg .lbl { fill: var(--fg-dim); font-size: 10px; font-family: var(--mono); }
+.timeline-svg .lbl-side { fill: var(--fg); font-size: 11px; font-family: var(--mono); font-weight: 600; }
+.timeline-summary { color: var(--fg-dim); font-size: 11px; margin-top: 8px; }
+.timeline-summary b { color: var(--fg); font-weight: 500; }
+.timeline-tooltip { position: absolute; background: var(--bg); border: 1px solid var(--accent);
+  padding: 6px 9px; border-radius: 3px; font-size: 11px; color: var(--fg);
+  pointer-events: none; display: none; max-width: 280px; line-height: 1.4; z-index: 1; }
+.timeline-tooltip.show { display: block; }
+.timeline-tooltip b { color: var(--accent); }
+.timeline-tooltip .dim { color: var(--fg-dim); }
 </style>
 </head>
 <body>
@@ -121,8 +150,23 @@ main { padding: 0 14px 24px; }
     </select>
     <button id="reset" title="clear all filters">reset</button>
     <button id="expandAll" title="expand all visible rows">expand</button>
+    <button id="toggleTimeline" title="postings & removals over time">↗ timeline</button>
   </div>
 </header>
+<div class="modal-overlay" id="timelineModal" role="dialog" aria-modal="true" aria-label="postings and removals over time">
+  <div class="modal">
+    <button class="modal-close" id="timelineClose" aria-label="close">×</button>
+    <div class="modal-head">
+      <h2>POSTINGS & REMOVALS</h2>
+      <span class="meta" id="timelineMeta"></span>
+    </div>
+    <div style="position:relative">
+      <svg class="timeline-svg" id="timelineSvg" viewBox="0 0 1000 320" preserveAspectRatio="none"></svg>
+      <div class="timeline-tooltip" id="timelineTip"></div>
+    </div>
+    <div class="timeline-summary" id="timelineSummary"></div>
+  </div>
+</div>
 <main id="rows"></main>
 <script id="data" type="application/json">__DATA_JSON__</script>
 <script>
@@ -259,6 +303,7 @@ main { padding: 0 14px 24px; }
       const isNew = j.first_seen && STATE.last_synced && j.first_seen >= STATE.last_synced;
       const isRemoved = j.status === 'removed';
       row.className = 'row' + (isNew ? ' new' : '') + (isRemoved ? ' removed' : '');
+      row.setAttribute('data-jid', j.id);
       const url = escape(j.url || '');
       row.innerHTML =
         '<div class="line1">' +
@@ -314,6 +359,142 @@ main { padding: 0 14px 24px; }
   });
   syncChkLabels();
   applyFilters();
+
+  // ── Bubble timeline modal ───────────────────────────────────────────────
+  const TM = {
+    btn: document.getElementById('toggleTimeline'),
+    modal: document.getElementById('timelineModal'),
+    closeBtn: document.getElementById('timelineClose'),
+    svg: document.getElementById('timelineSvg'),
+    tip: document.getElementById('timelineTip'),
+    meta: document.getElementById('timelineMeta'),
+    summary: document.getElementById('timelineSummary'),
+  };
+  function hideTip() { TM.tip.classList.remove('show'); }
+  function openTimeline() { TM.modal.classList.add('open'); renderTimeline(); }
+  function closeTimeline() { TM.modal.classList.remove('open'); hideTip(); }
+  TM.btn.addEventListener('click', openTimeline);
+  TM.closeBtn.addEventListener('click', closeTimeline);
+  TM.modal.addEventListener('click', e => { if (e.target === TM.modal) closeTimeline(); });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && TM.modal.classList.contains('open')) closeTimeline();
+  });
+
+  function renderTimeline() {
+    const W = 1000, H = 320;
+    const PAD_X = 50, PAD_Y_TOP = 24, PAD_Y_BOT = 28;
+    const MID = (PAD_Y_TOP + (H - PAD_Y_BOT)) / 2;
+
+    const newEvents = [], remEvents = [];
+    STATE.jobs.forEach(j => {
+      const lvls = j.levels || [];
+      const lvl = lvls.length ? Math.max.apply(null, lvls) : 0;
+      if (j.t_create) newEvents.push({ ts: j.t_create, lvl: lvl, title: j.title, displayId: j.display_id, jid: j.id });
+      if (j.removed_at) remEvents.push({ ts: j.removed_at, lvl: lvl, title: j.title, displayId: j.display_id, jid: j.id });
+    });
+
+    if (!newEvents.length && !remEvents.length) {
+      TM.svg.innerHTML = '<text x="500" y="160" text-anchor="middle" class="lbl">no data yet — wait for the next sync</text>';
+      TM.summary.innerHTML = '';
+      TM.meta.textContent = '';
+      return;
+    }
+
+    const allTs = newEvents.concat(remEvents).map(e => e.ts);
+    const minTs = Math.min.apply(null, allTs);
+    const maxTs = Math.max.apply(null, allTs.concat([Date.now() / 1000]));
+    const range = Math.max(maxTs - minTs, 86400);
+
+    function xFor(ts) { return PAD_X + (ts - minTs) / range * (W - 2 * PAD_X); }
+
+    // Stack overlapping dots in time bins so they don't all sit on top of each other.
+    const binSeconds = range / 80;
+    const stacks = {};
+    function place(ev, isNew) {
+      const b = Math.floor((ev.ts - minTs) / binSeconds);
+      const key = (isNew ? 'n' : 'r') + b;
+      stacks[key] = (stacks[key] || 0) + 1;
+      const idx = stacks[key];
+      const r = 2.5 + Math.max(0, ev.lvl - 3) * 0.9;
+      const step = Math.max(2 * r + 1.5, 6);
+      const offset = 8 + (idx - 1) * step;
+      return { x: xFor(ev.ts), y: isNew ? MID - offset : MID + offset, r: r };
+    }
+
+    newEvents.sort((a, b) => a.ts - b.ts);
+    remEvents.sort((a, b) => a.ts - b.ts);
+
+    let svg = '';
+    // Faint vertical week gridlines.
+    const weekStart = Math.ceil(minTs / 604800) * 604800;
+    for (let t = weekStart; t <= maxTs; t += 604800) {
+      const x = xFor(t);
+      svg += '<line x1="' + x + '" y1="' + PAD_Y_TOP + '" x2="' + x + '" y2="' + (H - PAD_Y_BOT) + '" stroke="#262626" stroke-width="1" opacity="0.5"/>';
+    }
+    // Center time axis.
+    svg += '<line class="axis" x1="' + PAD_X + '" y1="' + MID + '" x2="' + (W - PAD_X) + '" y2="' + MID + '" stroke-width="1"/>';
+    // Side labels.
+    svg += '<text class="lbl-side" x="' + (PAD_X - 6) + '" y="' + (PAD_Y_TOP + 12) + '" text-anchor="end" fill="#4ade80">new ↑</text>';
+    svg += '<text class="lbl-side" x="' + (PAD_X - 6) + '" y="' + (H - PAD_Y_BOT - 4) + '" text-anchor="end" fill="#ef4444">↓ rem</text>';
+
+    // Bottom date ticks (~6 evenly spaced).
+    const TICKS = 6;
+    for (let i = 0; i <= TICKS; i++) {
+      const t = minTs + (range * i / TICKS);
+      const x = xFor(t);
+      svg += '<text class="lbl" x="' + x + '" y="' + (H - 6) + '" text-anchor="middle">' + fmtDate(t) + '</text>';
+    }
+
+    // Postings (above) — bigger dot for higher level.
+    newEvents.forEach(e => {
+      const p = place(e, true);
+      svg += '<circle class="new-dot" cx="' + p.x + '" cy="' + p.y + '" r="' + p.r + '" data-jid="' + e.jid + '" data-ts="' + e.ts + '" data-kind="new" data-id="' + escape(e.displayId) + '" data-title="' + escape(e.title) + '" data-lvl="' + e.lvl + '"></circle>';
+    });
+    // Removals (below).
+    remEvents.forEach(e => {
+      const p = place(e, false);
+      svg += '<circle class="rem-dot" cx="' + p.x + '" cy="' + p.y + '" r="' + p.r + '" data-jid="' + e.jid + '" data-ts="' + e.ts + '" data-kind="rem" data-id="' + escape(e.displayId) + '" data-title="' + escape(e.title) + '" data-lvl="' + e.lvl + '"></circle>';
+    });
+
+    TM.svg.innerHTML = svg;
+
+    TM.svg.querySelectorAll('circle').forEach(c => {
+      c.addEventListener('mousemove', ev => {
+        const kind = c.getAttribute('data-kind');
+        const lvl = c.getAttribute('data-lvl');
+        const lvlTxt = lvl && lvl !== '0' ? 'L' + lvl : 'no level';
+        const ts = parseInt(c.getAttribute('data-ts'), 10);
+        const verb = kind === 'new' ? 'posted' : 'removed';
+        TM.tip.innerHTML =
+          '<b>' + escape(c.getAttribute('data-id')) + '</b> <span class="dim">' + lvlTxt + '</span><br>' +
+          escape(c.getAttribute('data-title')) +
+          '<br><span class="dim">' + verb + ' ' + fmtDate(ts) + ' (' + daysAgo(ts) + ')</span>';
+        const parentRect = TM.svg.parentElement.getBoundingClientRect();
+        let tx = ev.clientX - parentRect.left + 12;
+        let ty = ev.clientY - parentRect.top + 12;
+        const tipW = 280;
+        if (tx + tipW > parentRect.width) tx = parentRect.width - tipW - 4;
+        TM.tip.style.left = tx + 'px';
+        TM.tip.style.top = ty + 'px';
+        TM.tip.classList.add('show');
+      });
+      c.addEventListener('mouseleave', hideTip);
+      c.addEventListener('click', () => {
+        const jid = c.getAttribute('data-jid');
+        const row = document.querySelector('.row[data-jid="' + jid + '"]');
+        if (row) {
+          closeTimeline();
+          row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          row.classList.add('expanded');
+        }
+      });
+    });
+
+    TM.meta.textContent = fmtDate(minTs) + ' → ' + fmtDate(maxTs);
+    TM.summary.innerHTML =
+      '<b>' + newEvents.length + '</b> postings tracked · <b>' + remEvents.length + '</b> removed · ' +
+      'dot size scales with level · click a dot to jump to its row';
+  }
 })();
 </script>
 </body>
