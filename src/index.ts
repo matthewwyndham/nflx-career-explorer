@@ -1,6 +1,6 @@
 import { emptyPage, renderPage } from './render';
-import { STORE_KEY } from './store';
-import { syncJobs } from './sync';
+import { loadStore, saveStore, STORE_KEY } from './store';
+import { enrichJobs, needsEnrich, syncJobs } from './sync';
 import type { Env } from './types';
 
 const HTML_CACHE_SECONDS = 600;
@@ -41,11 +41,37 @@ export default {
 
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     console.log(`[scheduled] cron=${event.cron} scheduledTime=${new Date(event.scheduledTime).toISOString()}`);
-    const maxEnrich = env.ENRICH_PER_RUN ? parseInt(env.ENRICH_PER_RUN, 10) : 250;
-    ctx.waitUntil(syncJobs(env, { maxEnrich }).then(
+    // Refresh the listing (new/removed detection) and enqueue jobs needing
+    // enrichment. The all-teams listing alone is ~48 of the free plan's 50
+    // external subrequests, so enrichment happens separately in queue() below.
+    ctx.waitUntil(syncJobs(env, { skipEnrich: true, enqueue: true }).then(
       r => console.log('[scheduled] sync ok', r),
       e => console.error('[scheduled] sync failed', e),
     ));
+  },
+
+  // Queue consumer: drains ENRICH_QUEUE, enriching jobs in batches. Runs at
+  // max_concurrency = 1 (see wrangler.toml) so writes to the single jobs.json
+  // blob never interleave. Failed messages retry with a backoff delay; whatever
+  // still fails after max_retries is re-enqueued by the next daily cron.
+  async queue(batch: MessageBatch<{ id: string }>, env: Env, _ctx: ExecutionContext): Promise<void> {
+    const store = await loadStore(env);
+    const ids = batch.messages
+      .map(m => String(m.body.id))
+      .filter(jid => needsEnrich(store.jobs[jid]));
+    if (ids.length === 0) {
+      batch.ackAll(); // all already enriched / removed — nothing to fetch
+      return;
+    }
+    console.log(`[queue] enriching ${ids.length}/${batch.messages.length} message(s)…`);
+    const { failedIds } = await enrichJobs(env, store, ids);
+    await saveStore(env, store);
+    const failed = new Set(failedIds);
+    for (const m of batch.messages) {
+      if (failed.has(String(m.body.id))) m.retry({ delaySeconds: 30 });
+      else m.ack();
+    }
+    if (failed.size) console.warn(`[queue] ${failed.size} enrichment(s) failed; will retry`);
   },
 };
 
@@ -98,11 +124,14 @@ async function handleSync(request: Request, env: Env): Promise<Response> {
 
   const url = new URL(request.url);
   const max = url.searchParams.get('max');
+  const skipEnrich = url.searchParams.get('skip-enrich') === '1';
   const result = await syncJobs(env, {
     maxEnrich: max ? parseInt(max, 10) : undefined,
-    skipEnrich: url.searchParams.get('skip-enrich') === '1',
+    skipEnrich,
+    // A listing-only refresh hands enrichment to the queue consumer.
+    enqueue: skipEnrich,
     // Skip the listing fetch and spend the whole subrequest budget on
-    // enrichment — used to backfill descriptions/salaries on the free plan.
+    // enrichment — used to backfill descriptions/salaries directly.
     enrichOnly: url.searchParams.get('enrich-only') === '1',
   });
   return Response.json(result);

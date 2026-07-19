@@ -61,12 +61,15 @@ export interface SyncResult {
 
 export interface Env {
   DATA: R2Bucket;
+  // Queue of job ids awaiting enrichment. The listing cron / manual refresh
+  // produces to it; the queue() consumer in index.ts drains it.
+  ENRICH_QUEUE: Queue<{ id: string }>;
   // Restrict sync to a single Netflix team (the `Teams` facet value). Unset =
   // sync every team.
   TEAM?: string;
   SYNC_TOKEN?: string;
-  // Max jobs to enrich per scheduled run. Each enrichment costs 1 fetch + 1 R2
-  // put, so this keeps a single all-teams run within the subrequest budget
-  // (paid = 1000); the daily cron catches up on the rest. Default 250.
+  // Max jobs to enrich in one direct (non-queue) enrich pass — e.g. the manual
+  // `POST /sync?enrich-only=1`. Kept under the free plan's 50-subrequest budget
+  // (each enrichment is 1 fetch; retries may add a few). Default 40.
   ENRICH_PER_RUN?: string;
 }

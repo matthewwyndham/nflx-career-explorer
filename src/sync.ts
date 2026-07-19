@@ -1,7 +1,7 @@
 import { fetchJobDetail, fetchListing, sleep } from './netflix';
 import { htmlToText, parseSalary } from './parsers';
 import { loadStore, saveDescription, saveStore } from './store';
-import type { Env, SyncResult } from './types';
+import type { Env, JobRecord, Store, SyncResult } from './types';
 
 // Enrichment hits Netflix's detail API once per job. Keep the pressure modest:
 // at most ENRICH_CONCURRENCY in flight, with a short gap between batches. This
@@ -35,6 +35,68 @@ export interface SyncOptions {
   // subrequest budget is tight (free plan = 50, paid = 1000). Remaining jobs
   // get picked up by the next cron run because their _enriched_at stays null.
   maxEnrich?: number;
+  // After a listing refresh, enqueue every job still needing enrichment onto
+  // ENRICH_QUEUE for the consumer to process. Ignored for enrichOnly runs.
+  enqueue?: boolean;
+}
+
+// A job needs enrichment if it's open and either never enriched or updated on
+// Netflix's side since we last enriched it. Shared by syncJobs, the queue
+// producer, and the queue consumer so they all agree on what's pending.
+export function needsEnrich(j: JobRecord | undefined): boolean {
+  if (!j || j._status !== 'open') return false;
+  const tUpdate = j.t_update ?? 0;
+  return j._enriched_at == null || (tUpdate > 0 && tUpdate > j._enriched_at);
+}
+
+export interface EnrichOutcome {
+  ok: number;
+  failedIds: string[];
+}
+
+// Enriches the given job ids in place on `store`, fetching each job's detail,
+// persisting the raw description, and filling the derived fields. Does NOT save
+// the store — the caller decides when to persist. Reused by direct syncs and by
+// the queue consumer.
+export async function enrichJobs(
+  env: Env,
+  store: Store,
+  ids: string[],
+  opts: { concurrency?: number; batchDelayMs?: number } = {},
+): Promise<EnrichOutcome> {
+  const now = Math.floor(Date.now() / 1000);
+  const failedIds: string[] = [];
+  let ok = 0;
+  await chunkedForEach(ids, opts.concurrency ?? ENRICH_CONCURRENCY, async jid => {
+    const job = store.jobs[jid];
+    if (!job) return;
+    try {
+      const detail = await fetchJobDetail(jid);
+      await saveDescription(env, jid, detail);
+      const sal = parseSalary(detail.job_description ?? '');
+      job._enriched_at = now;
+      delete job._enrich_error;
+      job._salary_low = sal ? sal[0] : null;
+      job._salary_high = sal ? sal[1] : null;
+      job._description_text = htmlToText(detail.job_description ?? '');
+      ok++;
+    } catch (e) {
+      job._enrich_error = e instanceof Error ? e.message : String(e);
+      failedIds.push(jid);
+    }
+  }, opts.batchDelayMs ?? ENRICH_BATCH_DELAY_MS);
+  return { ok, failedIds };
+}
+
+// Sends the id of every job still needing enrichment to ENRICH_QUEUE (in
+// sendBatch chunks of 100 — the queue's per-call cap). Queue sends are internal
+// subrequests, so this doesn't eat the free plan's 50 external-fetch budget.
+export async function enqueuePending(env: Env, store: Store): Promise<number> {
+  const ids = Object.keys(store.jobs).filter(jid => needsEnrich(store.jobs[jid]));
+  for (let i = 0; i < ids.length; i += 100) {
+    await env.ENRICH_QUEUE.sendBatch(ids.slice(i, i + 100).map(id => ({ body: { id } })));
+  }
+  return ids.length;
 }
 
 export async function syncJobs(env: Env, opts: SyncOptions = {}): Promise<SyncResult> {
@@ -97,41 +159,26 @@ export async function syncJobs(env: Env, opts: SyncOptions = {}): Promise<SyncRe
   let enrichedOk = 0;
   let enrichedFailed = 0;
   if (!opts.skipEnrich) {
-    const needsEnrich: string[] = [];
-    for (const [jid, j] of Object.entries(jobs)) {
-      if (j._status !== 'open') continue;
-      const enrichedAt = j._enriched_at;
-      const tUpdate = j.t_update ?? 0;
-      if (enrichedAt == null || (tUpdate && tUpdate > enrichedAt)) {
-        needsEnrich.push(jid);
-      }
-    }
+    const pending = Object.keys(jobs).filter(jid => needsEnrich(jobs[jid]));
     // Prioritise newest creations first so visible content fills in quickly
     // when we're capped under maxEnrich.
-    needsEnrich.sort((a, b) => (jobs[b]!.t_create ?? 0) - (jobs[a]!.t_create ?? 0));
-    const target = opts.maxEnrich ? needsEnrich.slice(0, opts.maxEnrich) : needsEnrich;
+    pending.sort((a, b) => (jobs[b]!.t_create ?? 0) - (jobs[a]!.t_create ?? 0));
+    const target = opts.maxEnrich ? pending.slice(0, opts.maxEnrich) : pending;
 
     if (target.length) {
-      console.log(`[sync] enriching ${target.length}/${needsEnrich.length} job(s)…`);
-      await chunkedForEach(target, ENRICH_CONCURRENCY, async jid => {
-        const job = jobs[jid]!;
-        try {
-          const detail = await fetchJobDetail(jid);
-          await saveDescription(env, jid, detail);
-          const sal = parseSalary(detail.job_description ?? '');
-          job._enriched_at = now;
-          delete job._enrich_error;
-          job._salary_low = sal ? sal[0] : null;
-          job._salary_high = sal ? sal[1] : null;
-          job._description_text = htmlToText(detail.job_description ?? '');
-          enrichedOk++;
-        } catch (e) {
-          job._enrich_error = e instanceof Error ? e.message : String(e);
-          enrichedFailed++;
-        }
-      }, ENRICH_BATCH_DELAY_MS);
+      console.log(`[sync] enriching ${target.length}/${pending.length} job(s)…`);
+      const outcome = await enrichJobs(env, store, target);
+      enrichedOk = outcome.ok;
+      enrichedFailed = outcome.failedIds.length;
       if (enrichedFailed) console.warn(`[sync] ${enrichedFailed} enrichment(s) failed; will retry next run`);
     }
+  }
+
+  // Hand enrichment off to the queue consumer (used by the listing cron / manual
+  // refresh). Guarded so runs without a queue binding still work.
+  if (opts.enqueue && !opts.enrichOnly && env.ENRICH_QUEUE) {
+    const queued = await enqueuePending(env, store);
+    console.log(`[sync] enqueued ${queued} job(s) for enrichment`);
   }
 
   await saveStore(env, store);

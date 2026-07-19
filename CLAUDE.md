@@ -20,6 +20,7 @@ npm run types        # regenerate worker-configuration.d.ts from wrangler.toml
 First-time setup (once per Cloudflare account):
 ```
 npx wrangler r2 bucket create netflix-careers-data    # name must match wrangler.toml
+npx wrangler queues create netflix-enrich             # enrichment queue; deploy fails without it
 npx wrangler secret put SYNC_TOKEN                     # optional; enables POST /sync
 ```
 
@@ -27,9 +28,10 @@ npx wrangler secret put SYNC_TOKEN                     # optional; enables POST 
 
 - `GET /` → renders the HTML page from `jobs.json` in R2. Edge-cached for 10 min; ETag = R2 object's upload time, so a fresh sync invalidates the cache.
 - `GET /api/jobs.json` → raw store passthrough.
-- `POST /sync?max=N&skip-enrich=1` → manual sync. Requires `Authorization: Bearer $SYNC_TOKEN`; returns 404 if the secret is unset (manual sync disabled).
+- `POST /sync?max=N&skip-enrich=1&enrich-only=1` → manual sync. Requires `Authorization: Bearer $SYNC_TOKEN`; returns 404 if the secret is unset. `skip-enrich=1` refreshes the listing and enqueues pending jobs (the queue drains them); `enrich-only=1&max=N` enriches up to N jobs inline, bypassing the queue (a fallback); bare `max=N` does a full listing + inline enrich.
 - `GET /healthz` → `ok`.
-- `scheduled()` runs `syncJobs(env)` daily at the cron in `wrangler.toml` (`0 12 * * *` by default).
+- `scheduled()` runs one daily cron (`0 12 * * *`): a listing-only refresh (`syncJobs({ skipEnrich: true, enqueue: true })`) that detects new/removed jobs and enqueues everything needing enrichment onto `ENRICH_QUEUE`.
+- `queue()` consumes `ENRICH_QUEUE`: loads the store, enriches the batch's jobs via `enrichJobs`, saves once, and acks/retries per message. See the enrichment-pipeline note below.
 
 ## Data layout (R2 bucket `DATA`)
 
@@ -52,8 +54,9 @@ Sync is idempotent and incremental: each run diffs the listing against the cache
 
 ## Worker-specific concerns
 
-- **Subrequest budget.** Free plan = 50 subrequests per invocation, paid = 1000. Each enrichment is one outbound fetch + one R2 put; the all-teams listing pass is ~48 fetches (`num` capped at 10). On the free plan that listing pass nearly exhausts the budget, so a full `POST /sync` can only enrich ~2 jobs — use `POST /sync?enrich-only=1&max=N` (which skips the listing) to backfill in batches, or `just refresh` then repeated `just enrich`. `syncJobs` accepts `maxEnrich` to cap a single run; remaining jobs get picked up next cron because their `_enriched_at` stays null. Newest-created jobs are enriched first so the visible page fills in quickly when capped.
-- **Throttling safeguards.** `httpGetJson` (`src/netflix.ts`) retries `429`/`5xx` with capped exponential backoff, honoring `Retry-After`. Enrichment runs at `ENRICH_CONCURRENCY = 4` with a `ENRICH_BATCH_DELAY_MS` gap between batches (`src/sync.ts`), and listing pages are spaced by `PAGE_DELAY_MS`. A per-job `try/catch` isolates a failed enrichment (sets `_enrich_error`, retried next run) so one 429 never aborts the sync.
+- **Subrequest budget + enrichment pipeline.** Free plan = 50 **external** fetches per invocation (R2/Queue and other Cloudflare-service calls count against a separate 1,000 internal budget, not the 50). The all-teams listing is ~48 external fetches (`num` capped at 10), so listing and enrichment **cannot** share an invocation — enrichment is decoupled through a queue. The listing cron / `POST /sync?skip-enrich=1` refreshes the store and calls `enqueuePending` (queue sends are internal, budget-free); the `queue()` consumer enriches in batches of `max_batch_size` (15), well under 50 external fetches. `POST /sync?enrich-only=1&max=N` still enriches inline as a queue-bypassing fallback. All three enrichment paths share `enrichJobs` / `needsEnrich` in `src/sync.ts`.
+- **Queue consumer runs at `max_concurrency = 1`** (`wrangler.toml`). The store is a single `jobs.json` blob rewritten wholesale, so concurrent consumers would clobber each other (last-writer-wins). Serializing them avoids that; it's the one non-obvious constraint if you tune the consumer. `max_retries = 3` with no dead-letter queue — a job that keeps failing drops for the cycle and the next daily cron re-enqueues it (`needsEnrich` still true), so the pipeline self-heals. The consumer is idempotent: it skips+acks any message whose job is already enriched. Residual risk: the daily cron's store write can race an in-flight consumer write; window is small and worst case is one job re-enriched next cycle.
+- **Throttling safeguards.** `httpGetJson` (`src/netflix.ts`) retries `429`/`5xx` with capped exponential backoff, honoring `Retry-After`. Enrichment runs at `ENRICH_CONCURRENCY = 4` with a `ENRICH_BATCH_DELAY_MS` gap between batches (`src/sync.ts`), and listing pages are spaced by `PAGE_DELAY_MS`. A per-job `try/catch` isolates a failed enrichment (sets `_enrich_error`); in the queue it also triggers a `msg.retry({ delaySeconds: 30 })`.
 - **Edge cache** for `/` is keyed on the request URL; `handleIndex` does `cache.match` / `cache.put` against `caches.default`. Bumping the ETag via R2 upload time is the invalidation mechanism.
 
 ## Adding a route

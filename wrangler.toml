@@ -2,7 +2,9 @@ name = "netflix-career-explorer"
 main = "src/index.ts"
 compatibility_date = "2025-12-01"
 
-# Daily sync at 12:00 UTC. Adjust to taste.
+# Daily listing refresh at 12:00 UTC: detects new/removed jobs (~48 subrequests)
+# and enqueues jobs needing enrichment onto ENRICH_QUEUE. Enrichment itself runs
+# in the queue consumer below, in a separate invocation with its own budget.
 [triggers]
 crons = ["0 12 * * *"]
 
@@ -11,6 +13,23 @@ crons = ["0 12 * * *"]
 [[r2_buckets]]
 binding = "DATA"
 bucket_name = "netflix-careers-data"
+
+# Enrichment queue. Create it once with:  npx wrangler queues create netflix-enrich
+# Producer: the listing cron / manual refresh enqueues job ids needing enrichment.
+[[queues.producers]]
+binding = "ENRICH_QUEUE"
+queue = "netflix-enrich"
+
+# Consumer: drains the queue and enriches jobs. max_concurrency = 1 because the
+# whole store is one jobs.json blob — serializing writes avoids last-writer-wins
+# clobber. Failed messages retry (Cloudflare-managed backoff); after max_retries
+# they drop and the next daily cron re-enqueues anything still pending.
+[[queues.consumers]]
+queue = "netflix-enrich"
+max_batch_size = 15
+max_batch_timeout = 10
+max_concurrency = 1
+max_retries = 3
 
 # Vars are public; SYNC_TOKEN below is set via `wrangler secret put SYNC_TOKEN`.
 # TEAM is unset, so sync pulls every Netflix team. Set it to a single team name
