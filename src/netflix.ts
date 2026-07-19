@@ -5,15 +5,43 @@ const PAGE_SIZE = 10; // The API silently caps responses at 10 regardless of `nu
 const PAGE_DELAY_MS = 150; // Gap between listing pages so we don't hammer the API.
 const USER_AGENT = 'netflix-careers-explorer/1.0 (+cloudflare-worker)';
 
-const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+// Back off and retry on throttling (429) and transient upstream errors so a
+// burst of enrichment fetches self-heals instead of failing outright. Honors a
+// Retry-After header when present, otherwise uses capped exponential backoff.
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+const MAX_ATTEMPTS = 3;
+const BACKOFF_BASE_MS = 600;
+const MAX_BACKOFF_MS = 8_000;
+
+export const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+function parseRetryAfter(header: string | null): number | null {
+  if (!header) return null;
+  const secs = Number(header);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const when = Date.parse(header);
+  if (Number.isFinite(when)) return Math.max(0, when - Date.now());
+  return null;
+}
 
 async function httpGetJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, {
-    headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
-    cf: { cacheTtl: 0, cacheEverything: false },
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText} for ${url}`);
-  return (await res.json()) as T;
+  for (let attempt = 1; ; attempt++) {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': USER_AGENT, Accept: 'application/json' },
+      cf: { cacheTtl: 0, cacheEverything: false },
+    });
+    if (res.ok) return (await res.json()) as T;
+    if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_ATTEMPTS) {
+      const retryAfter = parseRetryAfter(res.headers.get('retry-after'));
+      const backoff = retryAfter != null
+        ? Math.min(retryAfter, MAX_BACKOFF_MS)
+        : Math.min(MAX_BACKOFF_MS, BACKOFF_BASE_MS * 2 ** (attempt - 1));
+      console.warn(`[netflix] HTTP ${res.status} for ${url}; retry ${attempt}/${MAX_ATTEMPTS - 1} in ${backoff}ms`);
+      await sleep(backoff);
+      continue;
+    }
+    throw new Error(`HTTP ${res.status} ${res.statusText} for ${url}`);
+  }
 }
 
 interface ListingResponse {

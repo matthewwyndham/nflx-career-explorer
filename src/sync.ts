@@ -1,13 +1,24 @@
-import { fetchJobDetail, fetchListing } from './netflix';
+import { fetchJobDetail, fetchListing, sleep } from './netflix';
 import { htmlToText, parseSalary } from './parsers';
 import { loadStore, saveDescription, saveStore } from './store';
 import type { Env, SyncResult } from './types';
 
-const ENRICH_CONCURRENCY = 6;
+// Enrichment hits Netflix's detail API once per job. Keep the pressure modest:
+// at most ENRICH_CONCURRENCY in flight, with a short gap between batches. This
+// (plus the Retry-After backoff in netflix.ts) is what keeps automatic syncs
+// from getting throttled.
+const ENRICH_CONCURRENCY = 4;
+const ENRICH_BATCH_DELAY_MS = 300;
 
-async function chunkedForEach<T>(items: T[], n: number, fn: (item: T) => Promise<void>): Promise<void> {
+async function chunkedForEach<T>(
+  items: T[],
+  n: number,
+  fn: (item: T) => Promise<void>,
+  delayMs = 0,
+): Promise<void> {
   for (let i = 0; i < items.length; i += n) {
     await Promise.all(items.slice(i, i + n).map(fn));
+    if (delayMs && i + n < items.length) await sleep(delayMs);
   }
 }
 
@@ -118,7 +129,7 @@ export async function syncJobs(env: Env, opts: SyncOptions = {}): Promise<SyncRe
           job._enrich_error = e instanceof Error ? e.message : String(e);
           enrichedFailed++;
         }
-      });
+      }, ENRICH_BATCH_DELAY_MS);
       if (enrichedFailed) console.warn(`[sync] ${enrichedFailed} enrichment(s) failed; will retry next run`);
     }
   }

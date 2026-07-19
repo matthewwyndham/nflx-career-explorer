@@ -52,8 +52,8 @@ Sync is idempotent and incremental: each run diffs the listing against the cache
 
 ## Worker-specific concerns
 
-- **Subrequest budget.** Free plan = 50 subrequests per invocation, paid = 1000. Each enrichment is one outbound fetch + one R2 put. `syncJobs` accepts `maxEnrich` to cap a single run; remaining jobs get picked up next cron because their `_enriched_at` stays null. Newest-created jobs are enriched first so the visible page fills in quickly when capped.
-- **Concurrency** is fixed at `ENRICH_CONCURRENCY = 6` in `src/sync.ts`.
+- **Subrequest budget.** Free plan = 50 subrequests per invocation, paid = 1000. Each enrichment is one outbound fetch + one R2 put; the all-teams listing pass is ~48 fetches (`num` capped at 10). On the free plan that listing pass nearly exhausts the budget, so a full `POST /sync` can only enrich ~2 jobs — use `POST /sync?enrich-only=1&max=N` (which skips the listing) to backfill in batches, or `just refresh` then repeated `just enrich`. `syncJobs` accepts `maxEnrich` to cap a single run; remaining jobs get picked up next cron because their `_enriched_at` stays null. Newest-created jobs are enriched first so the visible page fills in quickly when capped.
+- **Throttling safeguards.** `httpGetJson` (`src/netflix.ts`) retries `429`/`5xx` with capped exponential backoff, honoring `Retry-After`. Enrichment runs at `ENRICH_CONCURRENCY = 4` with a `ENRICH_BATCH_DELAY_MS` gap between batches (`src/sync.ts`), and listing pages are spaced by `PAGE_DELAY_MS`. A per-job `try/catch` isolates a failed enrichment (sets `_enrich_error`, retried next run) so one 429 never aborts the sync.
 - **Edge cache** for `/` is keyed on the request URL; `handleIndex` does `cache.match` / `cache.put` against `caches.default`. Bumping the ETag via R2 upload time is the invalidation mechanism.
 
 ## Adding a route
