@@ -101,6 +101,9 @@ async function handleSync(request: Request, env: Env): Promise<Response> {
   const result = await syncJobs(env, {
     maxEnrich: max ? parseInt(max, 10) : undefined,
     skipEnrich: url.searchParams.get('skip-enrich') === '1',
+    // Skip the listing fetch and spend the whole subrequest budget on
+    // enrichment — used to backfill descriptions/salaries on the free plan.
+    enrichOnly: url.searchParams.get('enrich-only') === '1',
   });
   return Response.json(result);
 }

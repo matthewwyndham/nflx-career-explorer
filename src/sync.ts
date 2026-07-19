@@ -14,6 +14,12 @@ async function chunkedForEach<T>(items: T[], n: number, fn: (item: T) => Promise
 export interface SyncOptions {
   team?: string;
   skipEnrich?: boolean;
+  // Enrich only: skip the listing fetch and the new/removed diff entirely, and
+  // just enrich jobs already in the store. On the free plan the ~48-request
+  // all-teams listing pass nearly exhausts the 50-subrequest budget, leaving no
+  // room to enrich in the same invocation; enrich-only spends the whole budget
+  // on enrichment so a backfill can proceed ~45 jobs at a time.
+  enrichOnly?: boolean;
   // Cap on how many jobs to enrich in a single run. Useful when the worker's
   // subrequest budget is tight (free plan = 50, paid = 1000). Remaining jobs
   // get picked up by the next cron run because their _enriched_at stays null.
@@ -21,50 +27,60 @@ export interface SyncOptions {
 }
 
 export async function syncJobs(env: Env, opts: SyncOptions = {}): Promise<SyncResult> {
-  // Default: no team filter → fetch every team in one paginated pass. Set
-  // opts.team or the TEAM env var to restrict to a single team.
-  const team = opts.team ?? env.TEAM ?? undefined;
-  const teamLabel = team ?? 'All teams';
   const store = await loadStore(env);
   const jobs = store.jobs;
   const now = Math.floor(Date.now() / 1000);
 
-  console.log(`[sync] fetching ${teamLabel} jobs from Netflix…`);
-  const { positions, total } = await fetchListing(team);
-  if (total && positions.length < total) {
-    console.warn(`[sync] API reports ${total} jobs but only ${positions.length} returned`);
-  }
-
-  const fetchedIds = new Set<string>(positions.map(p => String(p.id)));
   const newIds: string[] = [];
   const updatedIds: string[] = [];
   const reappearedIds: string[] = [];
-
-  for (const p of positions) {
-    const jid = String(p.id);
-    const existing = jobs[jid];
-    if (!existing) {
-      jobs[jid] = { ...p, _first_seen: now, _last_seen: now, _status: 'open' };
-      newIds.push(jid);
-    } else {
-      const prevStatus = existing._status ?? 'open';
-      const prevTUpdate = existing.t_update;
-      Object.assign(existing, p);
-      existing._last_seen = now;
-      existing._status = 'open';
-      delete existing._removed_at;
-      if (prevStatus === 'removed') reappearedIds.push(jid);
-      else if (prevTUpdate && p.t_update && p.t_update !== prevTUpdate) updatedIds.push(jid);
-    }
-  }
-
   const removedNow: string[] = [];
-  for (const [jid, j] of Object.entries(jobs)) {
-    if (!fetchedIds.has(jid) && j._status === 'open') {
-      j._status = 'removed';
-      j._removed_at = now;
-      removedNow.push(jid);
+  let listedCount = 0;
+
+  if (opts.enrichOnly) {
+    listedCount = Object.values(jobs).filter(j => j._status === 'open').length;
+    console.log(`[sync] enrich-only run over ${listedCount} open job(s) (skipping listing fetch)…`);
+  } else {
+    // Default: no team filter → fetch every team in one paginated pass. Set
+    // opts.team or the TEAM env var to restrict to a single team.
+    const team = opts.team ?? env.TEAM ?? undefined;
+    const teamLabel = team ?? 'All teams';
+    console.log(`[sync] fetching ${teamLabel} jobs from Netflix…`);
+    const { positions, total } = await fetchListing(team);
+    listedCount = positions.length;
+    if (total && positions.length < total) {
+      console.warn(`[sync] API reports ${total} jobs but only ${positions.length} returned`);
     }
+
+    const fetchedIds = new Set<string>(positions.map(p => String(p.id)));
+    for (const p of positions) {
+      const jid = String(p.id);
+      const existing = jobs[jid];
+      if (!existing) {
+        jobs[jid] = { ...p, _first_seen: now, _last_seen: now, _status: 'open' };
+        newIds.push(jid);
+      } else {
+        const prevStatus = existing._status ?? 'open';
+        const prevTUpdate = existing.t_update;
+        Object.assign(existing, p);
+        existing._last_seen = now;
+        existing._status = 'open';
+        delete existing._removed_at;
+        if (prevStatus === 'removed') reappearedIds.push(jid);
+        else if (prevTUpdate && p.t_update && p.t_update !== prevTUpdate) updatedIds.push(jid);
+      }
+    }
+
+    for (const [jid, j] of Object.entries(jobs)) {
+      if (!fetchedIds.has(jid) && j._status === 'open') {
+        j._status = 'removed';
+        j._removed_at = now;
+        removedNow.push(jid);
+      }
+    }
+
+    store.last_synced = now;
+    store.team = teamLabel;
   }
 
   let enrichedOk = 0;
@@ -107,12 +123,10 @@ export async function syncJobs(env: Env, opts: SyncOptions = {}): Promise<SyncRe
     }
   }
 
-  store.last_synced = now;
-  store.team = teamLabel;
   await saveStore(env, store);
 
   const result: SyncResult = {
-    total: positions.length,
+    total: listedCount,
     newCount: newIds.length,
     removedCount: removedNow.length,
     updatedCount: updatedIds.length,
