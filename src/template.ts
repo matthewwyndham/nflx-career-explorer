@@ -86,6 +86,7 @@ main { padding: 0 14px 24px; }
 .row .line1 { display: flex; gap: 10px; align-items: baseline; }
 .row .line1 .id { color: var(--accent); font-weight: 600; min-width: 84px; }
 .row .line1 .title { color: var(--fg); flex: 1; word-break: break-word; }
+.row .line1 .title .team { color: var(--link); font-style: italic; font-size: 12px; font-weight: 400; }
 .row .line1 .level { color: var(--level); white-space: nowrap; }
 .row .line1 .salary { color: var(--salary); white-space: nowrap; }
 .row .line2 { color: var(--fg-dim); font-size: 12px; padding-left: 94px; }
@@ -463,7 +464,9 @@ main { padding: 0 14px 24px; }
       row.innerHTML =
         '<div class="line1">' +
           '<span class="id">' + escape(j.display_id) + '</span>' +
-          '<span class="title">' + escape(j.title) + '</span>' +
+          '<span class="title">' + escape(j.title) +
+            (j.team ? ' <span class="team">' + escape(j.team) + '</span>' : '') +
+          '</span>' +
           '<span class="level">' + fmtLevels(j.levels) + '</span>' +
           '<span class="salary">' + fmtSalary(j.salary_low, j.salary_high) + '</span>' +
         '</div>' +
