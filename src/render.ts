@@ -13,6 +13,7 @@ interface DisplayRecord {
   locations: string[];
   work_location_option: string;
   business_unit: string;
+  team: string;
   t_create: number | null;
   t_update: number | null;
   status: 'open' | 'removed';
@@ -49,6 +50,8 @@ function toRecord(jid: string, j: JobRecord): DisplayRecord {
     locations: j.locations ?? (j.location ? [j.location] : []),
     work_location_option: j.work_location_option ?? '',
     business_unit: j.business_unit ?? '',
+    // Netflix's "team" facet is carried on each position as `department`.
+    team: j.department ?? '',
     t_create: j.t_create ?? null,
     t_update: j.t_update ?? null,
     status: j._status ?? 'open',

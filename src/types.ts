@@ -61,6 +61,12 @@ export interface SyncResult {
 
 export interface Env {
   DATA: R2Bucket;
+  // Restrict sync to a single Netflix team (the `Teams` facet value). Unset =
+  // sync every team.
   TEAM?: string;
   SYNC_TOKEN?: string;
+  // Max jobs to enrich per scheduled run. Each enrichment costs 1 fetch + 1 R2
+  // put, so this keeps a single all-teams run within the subrequest budget
+  // (paid = 1000); the daily cron catches up on the rest. Default 250.
+  ENRICH_PER_RUN?: string;
 }

@@ -41,7 +41,8 @@ export default {
 
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     console.log(`[scheduled] cron=${event.cron} scheduledTime=${new Date(event.scheduledTime).toISOString()}`);
-    ctx.waitUntil(syncJobs(env).then(
+    const maxEnrich = env.ENRICH_PER_RUN ? parseInt(env.ENRICH_PER_RUN, 10) : 250;
+    ctx.waitUntil(syncJobs(env, { maxEnrich }).then(
       r => console.log('[scheduled] sync ok', r),
       e => console.error('[scheduled] sync failed', e),
     ));

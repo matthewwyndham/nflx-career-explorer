@@ -13,8 +13,12 @@ binding = "DATA"
 bucket_name = "netflix-careers-data"
 
 # Vars are public; SYNC_TOKEN below is set via `wrangler secret put SYNC_TOKEN`.
+# TEAM is unset, so sync pulls every Netflix team. Set it to a single team name
+# (a `Teams` facet value, e.g. "Engineering") to restrict the scrape to one team.
+# ENRICH_PER_RUN caps enrichment fetches per scheduled run (default 250).
 [vars]
-TEAM = "Engineering"
+# TEAM = "Engineering"
+# ENRICH_PER_RUN = "250"
 
 [observability]
 enabled = true

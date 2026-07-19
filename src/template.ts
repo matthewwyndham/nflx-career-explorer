@@ -52,6 +52,26 @@ input:focus, select:focus { border-color: var(--accent); }
 input[type="search"] { min-width: 160px; }
 input[type="number"] { width: 56px; }
 button { cursor: pointer; }
+/* Multi-select dropdown (location filter). */
+.ms { position: relative; display: inline-block; }
+.ms-btn.active { border-color: var(--accent); color: var(--accent); }
+.ms-panel { position: absolute; top: calc(100% + 4px); left: 0; z-index: 20;
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 4px;
+  padding: 6px; width: 280px; display: none; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }
+.ms.open .ms-panel { display: block; }
+.ms-search { width: 100%; margin-bottom: 6px; }
+.ms-actions { display: flex; justify-content: flex-end; margin-bottom: 6px; }
+.ms-actions button { padding: 2px 8px; font-size: 11px; }
+.ms-list { max-height: 260px; overflow-y: auto; }
+.ms-group { color: var(--fg-faint); font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.5px; margin: 6px 2px 2px; }
+.ms-opt { display: flex; align-items: center; gap: 7px; padding: 3px 4px; cursor: pointer;
+  border-radius: 3px; color: var(--fg-dim); }
+.ms-opt:hover { background: var(--bg-hover); color: var(--fg); }
+.ms-opt.sel { color: var(--fg); }
+.ms-opt input { display: inline-block; width: auto; padding: 0; margin: 0; accent-color: var(--accent); }
+.ms-opt .lbl { flex: 1; word-break: break-word; }
+.ms-opt .c { color: var(--fg-faint); font-size: 11px; }
 button:hover { border-color: var(--accent); color: var(--accent); }
 label.chk { display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
   user-select: none; padding: 3px 8px; border: 1px solid var(--border); border-radius: 3px;
@@ -126,15 +146,23 @@ main { padding: 0 14px 24px; }
   </div>
   <div class="toolbar">
     <input type="search" id="search" placeholder="title…">
-    <input type="search" id="location" placeholder="location…">
+    <div class="ms" id="locMS">
+      <button type="button" class="ms-btn" id="locBtn" title="filter by location / work type (choose any number)">location: all ▾</button>
+      <div class="ms-panel" id="locPanel">
+        <input type="search" class="ms-search" id="locSearch" placeholder="filter options…">
+        <div class="ms-actions"><button type="button" id="locClear">clear</button></div>
+        <div class="ms-list" id="locList"></div>
+      </div>
+    </div>
     <input type="search" id="bu" placeholder="business unit…">
+    <select id="team"><option value="">all teams</option></select>
     <span class="sep">|</span>
     <label class="chk"><input type="checkbox" id="lvl-4"><span>L4</span></label>
     <label class="chk"><input type="checkbox" id="lvl-5"><span>L5</span></label>
     <label class="chk"><input type="checkbox" id="lvl-6"><span>L6</span></label>
     <label class="chk"><input type="checkbox" id="lvl-none"><span>no level</span></label>
     <span class="sep">|</span>
-    <label class="chk"><input type="checkbox" id="remote" checked><span>USA Remote</span></label>
+    <label class="chk" title="hide postings created more than 6 months ago"><input type="checkbox" id="max-age" checked><span>≤6mo</span></label>
     <label class="chk"><input type="checkbox" id="new"><span>NEW</span></label>
     <label class="chk"><input type="checkbox" id="recent"><span>recent</span></label>
     <input type="number" id="recent-days" value="7" min="1" max="365" title="days">
@@ -178,13 +206,13 @@ main { padding: 0 14px 24px; }
   };
   const F = {
     search: document.getElementById('search'),
-    location: document.getElementById('location'),
     bu: document.getElementById('bu'),
+    team: document.getElementById('team'),
     lvl4: document.getElementById('lvl-4'),
     lvl5: document.getElementById('lvl-5'),
     lvl6: document.getElementById('lvl-6'),
     lvlNone: document.getElementById('lvl-none'),
-    remote: document.getElementById('remote'),
+    maxAge: document.getElementById('max-age'),
     newOnly: document.getElementById('new'),
     recent: document.getElementById('recent'),
     recentDays: document.getElementById('recent-days'),
@@ -193,8 +221,120 @@ main { padding: 0 14px 24px; }
     reset: document.getElementById('reset'),
     expandAll: document.getElementById('expandAll'),
   };
+  // Postings older than this (by creation date) are hidden unless the ≤6mo
+  // toggle is switched off. Also bounds the timeline so old data doesn't skew it.
+  const SIX_MONTHS = 182 * 86400;
   const rows = document.getElementById('rows');
   const count = document.getElementById('count');
+
+  // Populate the team filter from the data (each job's team == its department).
+  // Counts reflect currently-open positions so the dropdown reads like the page.
+  (function () {
+    const counts = {};
+    STATE.jobs.forEach(j => {
+      if (j.status !== 'open') return;
+      const t = j.team || '—';
+      counts[t] = (counts[t] || 0) + 1;
+    });
+    Object.keys(counts).sort((a, b) => a.localeCompare(b)).forEach(t => {
+      const o = document.createElement('option');
+      o.value = t;
+      o.textContent = t + ' (' + counts[t] + ')';
+      F.team.appendChild(o);
+    });
+  })();
+
+  // ── Location filter (multi-select dropdown, inclusive OR) ─────────────────
+  // Combines work-type options (USA - Remote, onsite, remote) with every
+  // distinct location string. Selecting several matches jobs in ANY of them.
+  const selectedLocs = new Set();
+  const LOC = {
+    wrap: document.getElementById('locMS'),
+    btn: document.getElementById('locBtn'),
+    panel: document.getElementById('locPanel'),
+    search: document.getElementById('locSearch'),
+    clear: document.getElementById('locClear'),
+    list: document.getElementById('locList'),
+  };
+  // Special work-type tokens (won't collide with real location strings).
+  // The API mislabels USA-Remote jobs' work_location_option as onsite/remote_local
+  // (see isUSARemote), so those two buckets exclude anything that is really
+  // USA-Remote — otherwise a remote job would show up under "Onsite".
+  const WORK_TYPES = [
+    { v: '__remote:usa', label: 'USA - Remote', match: j => isUSARemote(j) },
+    { v: '__wlo:onsite', label: 'Onsite', match: j => j.work_location_option === 'onsite' && !isUSARemote(j) },
+    { v: '__wlo:remote_local', label: 'Remote (local)', match: j => j.work_location_option === 'remote_local' && !isUSARemote(j) },
+  ];
+  const WORK_MATCH = {};
+  WORK_TYPES.forEach(w => { WORK_MATCH[w.v] = w.match; });
+
+  function locMatches(j, v) {
+    if (WORK_MATCH[v]) return WORK_MATCH[v](j);
+    return (j.locations || []).includes(v);
+  }
+
+  (function buildLocOptions() {
+    // Count only currently-open postings so the numbers read like the page.
+    const wtCounts = {};
+    const locCounts = {};
+    STATE.jobs.forEach(j => {
+      if (j.status !== 'open') return;
+      WORK_TYPES.forEach(w => { if (w.match(j)) wtCounts[w.v] = (wtCounts[w.v] || 0) + 1; });
+      (j.locations || []).forEach(l => { locCounts[l] = (locCounts[l] || 0) + 1; });
+    });
+    let html = '<div class="ms-group">work type</div>';
+    WORK_TYPES.forEach(w => {
+      html += optRow(w.v, w.label, wtCounts[w.v] || 0);
+    });
+    html += '<div class="ms-group">locations</div>';
+    Object.keys(locCounts).sort((a, b) => a.localeCompare(b)).forEach(l => {
+      html += optRow(l, l, locCounts[l]);
+    });
+    LOC.list.innerHTML = html;
+  })();
+
+  function optRow(value, label, c) {
+    return '<label class="ms-opt" data-v="' + escape(value) + '" data-label="' +
+      escape(label.toLowerCase()) + '">' +
+      '<input type="checkbox" value="' + escape(value) + '">' +
+      '<span class="lbl">' + escape(label) + '</span>' +
+      '<span class="c">' + c + '</span></label>';
+  }
+
+  function updateLocBtn() {
+    const n = selectedLocs.size;
+    LOC.btn.textContent = 'location: ' + (n ? n + ' selected' : 'all') + ' ▾';
+    LOC.btn.classList.toggle('active', n > 0);
+  }
+
+  LOC.btn.addEventListener('click', () => {
+    LOC.wrap.classList.toggle('open');
+    if (LOC.wrap.classList.contains('open')) LOC.search.focus();
+  });
+  document.addEventListener('click', e => {
+    if (!LOC.wrap.contains(e.target)) LOC.wrap.classList.remove('open');
+  });
+  LOC.search.addEventListener('input', () => {
+    const q = LOC.search.value.trim().toLowerCase();
+    LOC.list.querySelectorAll('.ms-opt').forEach(o => {
+      o.style.display = !q || o.getAttribute('data-label').includes(q) ? '' : 'none';
+    });
+  });
+  LOC.list.addEventListener('change', e => {
+    const cb = e.target;
+    if (cb.tagName !== 'INPUT') return;
+    if (cb.checked) selectedLocs.add(cb.value); else selectedLocs.delete(cb.value);
+    cb.closest('.ms-opt').classList.toggle('sel', cb.checked);
+    updateLocBtn();
+    applyFilters();
+  });
+  LOC.clear.addEventListener('click', () => {
+    selectedLocs.clear();
+    LOC.list.querySelectorAll('input[type="checkbox"]').forEach(cb => { cb.checked = false; });
+    LOC.list.querySelectorAll('.ms-opt').forEach(o => o.classList.remove('sel'));
+    updateLocBtn();
+    applyFilters();
+  });
 
   function fmtSalaryValue(v) {
     if (v >= 1e6) {
@@ -242,6 +382,13 @@ main { padding: 0 14px 24px; }
   function isUSARemote(j) {
     return (j.locations || []).some(l => (l || '').trim() === 'USA - Remote');
   }
+  // work_location_option is unreliable for USA-Remote jobs (the API reports
+  // "onsite"/"remote_local" for them), so trust the location string first and
+  // only fall back to the raw field for everything else.
+  function workType(j) {
+    if (isUSARemote(j)) return 'Remote';
+    return j.work_location_option || '';
+  }
   function escape(s) {
     return String(s || '').replace(/[&<>"']/g, c => ({
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -250,15 +397,16 @@ main { padding: 0 14px 24px; }
 
   function applyFilters() {
     const s = F.search.value.trim().toLowerCase();
-    const loc = F.location.value.trim().toLowerCase();
     const bu = F.bu.value.trim().toLowerCase();
+    const teamVal = F.team.value;
     const wantLevels = new Set();
     if (F.lvl4.checked) wantLevels.add(4);
     if (F.lvl5.checked) wantLevels.add(5);
     if (F.lvl6.checked) wantLevels.add(6);
     const wantNone = F.lvlNone.checked;
     const anyLevelFilter = wantLevels.size || wantNone;
-    const remoteOnly = F.remote.checked;
+    const maxAgeOn = F.maxAge.checked;
+    const ageCutoff = Date.now() / 1000 - SIX_MONTHS;
     const newOnly = F.newOnly.checked;
     const recentOn = F.recent.checked;
     const recentDays = parseInt(F.recentDays.value) || 7;
@@ -268,12 +416,13 @@ main { padding: 0 14px 24px; }
     let rs = STATE.jobs.filter(j => {
       if (status === 'open' && j.status !== 'open') return false;
       if (status === 'removed' && j.status !== 'removed') return false;
+      if (maxAgeOn && (j.t_create || 0) < ageCutoff) return false;
       if (newOnly && (!j.first_seen || !STATE.last_synced || j.first_seen < STATE.last_synced)) return false;
       if (recentOn && (j.t_create || 0) < recentCutoff) return false;
-      if (remoteOnly && !isUSARemote(j)) return false;
+      if (selectedLocs.size && ![...selectedLocs].some(v => locMatches(j, v))) return false;
       if (s && !(j.title || '').toLowerCase().includes(s)) return false;
-      if (loc && !(j.locations || []).some(l => (l || '').toLowerCase().includes(loc))) return false;
       if (bu && !(j.business_unit || '').toLowerCase().includes(bu)) return false;
+      if (teamVal && (j.team || '') !== teamVal) return false;
       if (anyLevelFilter) {
         const ls = j.levels || [];
         if (ls.length === 0) {
@@ -304,6 +453,11 @@ main { padding: 0 14px 24px; }
       const isNew = j.first_seen && STATE.last_synced && j.first_seen >= STATE.last_synced;
       const isRemoved = j.status === 'removed';
       row.className = 'row' + (isNew ? ' new' : '') + (isRemoved ? ' removed' : '');
+      row.title = isRemoved
+        ? 'Removed — no longer listed on Netflix’s board (history kept)'
+        : isNew
+          ? '★ New — first appeared in the most recent sync'
+          : 'Open listing — tracked since ' + fmtDate(j.first_seen);
       row.setAttribute('data-jid', j.id);
       const url = escape(j.url || '');
       row.innerHTML =
@@ -315,7 +469,7 @@ main { padding: 0 14px 24px; }
         '</div>' +
         '<div class="line2">' +
           escape(summarizeLocs(j.locations)) +
-          (j.work_location_option ? ' · ' + escape(j.work_location_option) : '') +
+          (workType(j) ? ' · ' + escape(workType(j)) : '') +
           (j.business_unit ? ' · ' + escape(j.business_unit) : '') +
           ' · created ' + fmtDate(j.t_create) + ' (' + daysAgo(j.t_create) + ')' +
           (url ? ' · <a href="' + url + '" target="_blank" rel="noopener">open ↗</a>' : '') +
@@ -346,11 +500,12 @@ main { padding: 0 14px 24px; }
     el.addEventListener(ev, () => { syncChkLabels(); applyFilters(); });
   });
   F.reset.addEventListener('click', () => {
-    F.search.value = ''; F.location.value = ''; F.bu.value = '';
+    F.search.value = ''; F.bu.value = ''; F.team.value = '';
     F.lvl4.checked = F.lvl5.checked = F.lvl6.checked = F.lvlNone.checked = false;
-    F.remote.checked = true; F.newOnly.checked = false; F.recent.checked = false;
+    F.maxAge.checked = true; F.newOnly.checked = false; F.recent.checked = false;
     F.recentDays.value = 7;
     F.status.value = 'open'; F.sort.value = 'date';
+    LOC.clear.click();
     syncChkLabels(); applyFilters();
   });
   F.expandAll.addEventListener('click', () => {
@@ -386,12 +541,15 @@ main { padding: 0 14px 24px; }
     const PAD_X = 50, PAD_Y_TOP = 24, PAD_Y_BOT = 28;
     const MID = (PAD_Y_TOP + (H - PAD_Y_BOT)) / 2;
 
+    // Only chart the last 6 months — older events stretch the axis and make
+    // the bubble field look sparse and lopsided.
+    const chartCutoff = Date.now() / 1000 - SIX_MONTHS;
     const newEvents = [], remEvents = [];
     STATE.jobs.forEach(j => {
       const lvls = j.levels || [];
       const lvl = lvls.length ? Math.max.apply(null, lvls) : 0;
-      if (j.t_create) newEvents.push({ ts: j.t_create, lvl: lvl, title: j.title, displayId: j.display_id, jid: j.id });
-      if (j.removed_at) remEvents.push({ ts: j.removed_at, lvl: lvl, title: j.title, displayId: j.display_id, jid: j.id });
+      if (j.t_create && j.t_create >= chartCutoff) newEvents.push({ ts: j.t_create, lvl: lvl, title: j.title, displayId: j.display_id, jid: j.id });
+      if (j.removed_at && j.removed_at >= chartCutoff) remEvents.push({ ts: j.removed_at, lvl: lvl, title: j.title, displayId: j.display_id, jid: j.id });
     });
 
     if (!newEvents.length && !remEvents.length) {

@@ -21,12 +21,15 @@ export interface SyncOptions {
 }
 
 export async function syncJobs(env: Env, opts: SyncOptions = {}): Promise<SyncResult> {
-  const team = opts.team ?? env.TEAM ?? 'Engineering';
+  // Default: no team filter → fetch every team in one paginated pass. Set
+  // opts.team or the TEAM env var to restrict to a single team.
+  const team = opts.team ?? env.TEAM ?? undefined;
+  const teamLabel = team ?? 'All teams';
   const store = await loadStore(env);
   const jobs = store.jobs;
   const now = Math.floor(Date.now() / 1000);
 
-  console.log(`[sync] fetching ${team} jobs from Netflix…`);
+  console.log(`[sync] fetching ${teamLabel} jobs from Netflix…`);
   const { positions, total } = await fetchListing(team);
   if (total && positions.length < total) {
     console.warn(`[sync] API reports ${total} jobs but only ${positions.length} returned`);
@@ -105,7 +108,7 @@ export async function syncJobs(env: Env, opts: SyncOptions = {}): Promise<SyncRe
   }
 
   store.last_synced = now;
-  store.team = team;
+  store.team = teamLabel;
   await saveStore(env, store);
 
   const result: SyncResult = {
